@@ -1721,6 +1721,23 @@ defmodule Nx.Defn.GradTest do
       assert exp_cholesky_grad(t) ==
                Nx.tensor([[-0.5299541, -0.88652998], [3.59515929, 6.550619]])
     end
+
+    test "computes grad for composed complex {2,2}-tensor" do
+      t = ~M[
+        1.0 -2.0i
+        2.0i 5.0
+      ]
+
+      assert cholesky_cos_grad(t) == ~M[
+        -5.730538 2.654901i
+        -2.654901i -0.42073548
+      ]
+
+      assert exp_cholesky_grad(t) == ~M[
+        0.96568084 -0.14132036-0.2757584i
+        -0.14132036+0.2757584i  6.0988107
+      ]
+    end
   end
 
   describe "qr" do

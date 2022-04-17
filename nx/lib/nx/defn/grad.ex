@@ -543,11 +543,11 @@ defmodule Nx.Defn.Grad do
   end
 
   defp grad(:cholesky, [input], l, g) do
-    num = g |> tril() |> Nx.dot([0], l, [0]) |> Nx.transpose()
+    num = g |> tril() |> Nx.dot([0], l, [0]) |> Nx.LinAlg.adjoint()
     den = l |> Nx.eye() |> Nx.add(1)
     phi_tril = num |> Nx.divide(den) |> tril()
 
-    bm = Nx.LinAlg.triangular_solve(l, phi_tril, transform_a: :transpose)
+    bm = Nx.LinAlg.triangular_solve(Nx.LinAlg.adjoint(l), phi_tril)
     dl = Nx.LinAlg.triangular_solve(l, bm, left_side: false)
     [{input, dl}]
   end
