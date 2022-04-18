@@ -211,7 +211,7 @@ defmodule Nx.BinaryBackend.Matrix do
         {q, r} ->
           h =
             r
-            |> slice_matrix([i, i], [m - i, 1])
+            |> slice_matrix([i, i], [m - i, 1], :flat)
             |> householder_reflector(m, eps)
 
           # If we haven't allocated Q yet, let Q = H1
@@ -244,42 +244,93 @@ defmodule Nx.BinaryBackend.Matrix do
     # Validate that the input is a symmetric matrix using the relation A^t = A.
     a = binary_to_matrix(input_data, input_type, input_shape)
 
-    is_sym =
+    is_hermitian =
       a
       |> transpose_matrix()
+      |> conjugate_matrix()
       |> is_approximately_same?(a, eps)
 
-    unless is_sym do
-      raise ArgumentError, "input tensor must be symmetric"
+    unless is_hermitian do
+      raise ArgumentError, "input tensor must be self-adjoint"
     end
 
-    # Hessenberg decomposition
-    {h, q_h} = hessenberg_decomposition(a, n, eps)
+    eigvals =
+      a
+      |> eigh_qr_with_shifts(n, eps, max_iter, [])
+      |> Enum.sort_by(&Complex.abs_squared/1, :desc)
 
-    # QR iteration for eigenvalues and eigenvectors
-    {eigenvals_diag, eigenvecs} =
-      Enum.reduce_while(1..max_iter, {h, q_h}, fn _, {a_old, q_old} ->
+    eigenvecs = eig_inverse_iter(a, eigvals, n, eps)
+
+    {matrix_to_binary(eigvals, output_type), matrix_to_binary(eigenvecs, output_type)}
+  end
+
+  defp eigh_qr_with_shifts([[eig]], _n, _eps, _max_iter, eigvals),
+    do: Enum.reverse([eig | eigvals])
+
+  defp eigh_qr_with_shifts(a, n, eps, max_iter, eigvals) do
+    # Hessenberg decomposition
+    {h, _} = hessenberg_decomposition(a, n, eps)
+
+    # QR iteration with Wilkinson Shifts for eigenvalues
+    a =
+      Enum.reduce_while(1..max_iter, h, fn _, a_old ->
+        [a_n2n2, a_n2n1, a_n1n1] =
+          get_matrix_elements(a, [[n - 2, n - 2], [n - 2, n - 1], [n - 1, n - 1]])
+
+        mu = wilkinson_shift(a_n2n2, a_n1n1, a_n2n1)
+
+        # a = a_old - mu * I
+        a =
+          Enum.with_index(a_old, fn row, row_idx ->
+            Enum.with_index(row, fn elem, col_idx ->
+              if row_idx == col_idx do
+                elem - mu
+              else
+                elem
+              end
+            end)
+          end)
+
         # QR decomposition
-        {q_now, r_now} = qr_decomposition(a_old, n, n, eps)
+        {q_now, r_now} = qr_decomposition(a, n, n, eps)
 
         # Update matrix A, Q
-        a_new = dot_matrix(r_now, q_now)
-        q_new = dot_matrix(q_old, q_now)
+        a_new_prime = dot_matrix(r_now, q_now)
 
-        if is_approximately_same?(q_old, q_new, eps) do
-          {:halt, {a_new, q_new}}
+        # a_new = a_new_prime - mu * I
+        a_new =
+          Enum.with_index(a_new_prime, fn row, row_idx ->
+            Enum.with_index(row, fn elem, col_idx ->
+              if row_idx == col_idx do
+                elem + mu
+              else
+                elem
+              end
+            end)
+          end)
+
+        [x] = get_matrix_elements(a_new, [[n - 1, n - 2]])
+
+        if Complex.abs_squared(x) <= eps ** 2 do
+          {:halt, a_new}
         else
-          {:cont, {a_new, q_new}}
+          {:cont, a_new}
         end
       end)
 
-    # Obtain the eigenvalues, which are the diagonal elements
-    indices_diag = for idx <- 0..(n - 1), do: [idx, idx]
-    eigenvals = get_matrix_elements(eigenvals_diag, indices_diag)
+    # Get the current dominant eigenvalue and iterate over the n-1 x n-1 submatrix
+    [eigval] = get_matrix_elements(a, [[n - 1, n - 1]])
 
-    # Reduce the elements smaller than eps to zero
-    {eigenvals |> approximate_zeros(eps) |> matrix_to_binary(output_type),
-     eigenvecs |> approximate_zeros(eps) |> matrix_to_binary(output_type)}
+    eigval =
+      if Complex.abs(eigval) < eps do
+        0
+      else
+        eigval
+      end
+
+    a
+    |> slice_matrix([0, 0], [n - 1, n - 1], :matrix)
+    |> eigh_qr_with_shifts(n - 1, eps, max_iter, [eigval | eigvals])
   end
 
   defp hessenberg_decomposition(matrix, n, eps) do
@@ -289,7 +340,7 @@ defmodule Nx.BinaryBackend.Matrix do
         {hess, q} ->
           h =
             hess
-            |> slice_matrix([i + 1, i], [n - i - 1, 1])
+            |> slice_matrix([i + 1, i], [n - i - 1, 1], :flat)
             |> householder_reflector(n, eps)
 
           # If we haven't allocated Q yet, let Q = H1
@@ -314,6 +365,47 @@ defmodule Nx.BinaryBackend.Matrix do
     {approximate_zeros(hess_matrix, eps), approximate_zeros(q_matrix, eps)}
   end
 
+  defp wilkinson_shift(a, b, c) do
+    delta = (a - c) / 2
+    sign = if delta > 0, do: 1, else: -1
+
+    c -
+      sign * b ** 2 /
+        (Complex.abs(delta) + Complex.sqrt(Complex.abs_squared(delta) + Complex.abs_squared(b)))
+  end
+
+  defp eig_inverse_iter(a, eigvals, n, eps) do
+    eigvecs =
+      for eig <- eigvals do
+        # m = a - eig*I
+        m =
+          Enum.with_index(a, fn row, row_idx ->
+            Enum.with_index(row, fn val, col_idx ->
+              if row_idx == col_idx do
+                val - eig + 10 * eps
+              else
+                val
+              end
+            end)
+          end)
+
+        q = Enum.map(1..n, fn _ -> :rand.uniform() end)
+
+        v_prime =
+          m
+          |> solve(q, eps)
+          |> List.flatten()
+
+        norm_v = :math.sqrt(Enum.reduce(v_prime, 0, &(Complex.abs_squared(&1) + &2)))
+
+        Enum.map(v_prime, &(&1 / norm_v))
+      end
+
+    # eigvecs is as list of vectors.
+    # We want to concatenate them as if they were columns.
+    Enum.zip_with(eigvecs, & &1)
+  end
+
   defp is_approximately_same?(a, b, eps) do
     # Determine if matrices `a` and `b` are equal in the range of eps
     a
@@ -321,8 +413,37 @@ defmodule Nx.BinaryBackend.Matrix do
     |> Enum.all?(fn {a_row, b_row} ->
       a_row
       |> Enum.zip(b_row)
-      |> Enum.all?(fn {a_elem, b_elem} -> abs(a_elem - b_elem) <= eps end)
+      |> Enum.all?(fn {a_elem, b_elem} ->
+        %{re: a_re, im: a_im} = to_complex(a_elem)
+        %{re: b_re, im: b_im} = to_complex(b_elem)
+
+        abs(a_re - b_re) <= eps and abs(a_im - b_im) <= eps
+      end)
     end)
+  end
+
+  defp solve(a, b, eps) do
+    # To solve Ax = b, we can use
+    # Ax = QRx = b -> Rx = adjoint(Q)b = c
+    # And then triangular_solve(R, c)
+
+    [row | _] = a
+    m = length(a)
+    n = length(row)
+
+    {q, r} = qr_decomposition(a, m, n, eps)
+
+    adjoint_q = q |> transpose_matrix() |> conjugate_matrix()
+    c = dot_matrix(adjoint_q, b)
+
+    # Taken from `ts/8`
+    opts = %{lower: false, left_side: true}
+    a_matrix = ts_handle_opts(r, opts, :a)
+    b_vec = ts_handle_opts(c, opts, :b)
+
+    a_matrix
+    |> do_ts(b_vec, {m, 1})
+    |> ts_handle_opts(opts, :result)
   end
 
   def lu(input_data, input_type, {n, n} = input_shape, p_type, l_type, u_type, opts) do
@@ -343,8 +464,8 @@ defmodule Nx.BinaryBackend.Matrix do
           u =
             for i <- 0..j, reduce: u do
               u ->
-                u_slice = slice_matrix(u, [0, j], [i, 1])
-                l_slice = slice_matrix(l, [i, 0], [1, i])
+                u_slice = slice_matrix(u, [0, j], [i, 1], :flat)
+                l_slice = slice_matrix(l, [i, 0], [1, i], :flat)
                 sum = dot_matrix(u_slice, l_slice)
                 [a_ij] = get_matrix_elements(a_prime, [[i, j]])
 
@@ -360,8 +481,8 @@ defmodule Nx.BinaryBackend.Matrix do
           l =
             for i <- j..(n - 1), i != j, reduce: l do
               l ->
-                u_slice = slice_matrix(u, [0, j], [i, 1])
-                l_slice = slice_matrix(l, [i, 0], [1, i])
+                u_slice = slice_matrix(u, [0, j], [i, 1], :flat)
+                l_slice = slice_matrix(l, [i, 0], [1, i], :flat)
                 sum = dot_matrix(u_slice, l_slice)
 
                 [a_ij] = get_matrix_elements(a_prime, [[i, j]])
@@ -647,7 +768,7 @@ defmodule Nx.BinaryBackend.Matrix do
       {ll, a, rr} ->
         # a[[col..m-1, col]] -> take `m - col` rows from the `col`-th column
         row_length = if m < col, do: 0, else: m - col
-        a_col = a |> slice_matrix([col, col], [row_length, 1])
+        a_col = a |> slice_matrix([col, col], [row_length, 1], :flat)
 
         l = householder_reflector(a_col, m, eps)
 
@@ -666,7 +787,7 @@ defmodule Nx.BinaryBackend.Matrix do
 
             r =
               a
-              |> slice_matrix([col, col + 1], [1, n - col])
+              |> slice_matrix([col, col + 1], [1, n - col], :flat)
               |> householder_reflector(n, eps)
 
             rr =
@@ -781,6 +902,10 @@ defmodule Nx.BinaryBackend.Matrix do
     Enum.zip_with(m, & &1)
   end
 
+  defp conjugate_matrix(m) do
+    Enum.map(m, fn row -> Enum.map(row, &Complex.conjugate/1) end)
+  end
+
   defp matrix_to_binary([r | _] = m, type) when is_list(r) do
     match_types [type] do
       for row <- m, number <- row, into: "", do: <<write!(number, 0)>>
@@ -805,10 +930,16 @@ defmodule Nx.BinaryBackend.Matrix do
     |> Enum.chunk_every(num_cols)
   end
 
-  defp slice_matrix(a, [row_start, col_start], [row_length, col_length]) do
+  defp slice_matrix(a, [row_start, col_start], [row_length, col_length], :flat) do
     a
     |> Enum.slice(row_start, row_length)
     |> Enum.flat_map(&Enum.slice(&1, col_start, col_length))
+  end
+
+  defp slice_matrix(a, [row_start, col_start], [row_length, col_length], :matrix) do
+    a
+    |> Enum.slice(row_start, row_length)
+    |> Enum.map(&Enum.slice(&1, col_start, col_length))
   end
 
   defp get_matrix_column(m, col) do
@@ -867,4 +998,7 @@ defmodule Nx.BinaryBackend.Matrix do
       e -> do_round.(e)
     end)
   end
+
+  defp to_complex(%Complex{} = z), do: z
+  defp to_complex(x), do: Complex.new(x)
 end

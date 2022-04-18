@@ -813,13 +813,13 @@ defmodule Nx.LinAlg do
       iex> Nx.round(eigenvals)
       #Nx.Tensor<
         f32[2]
-        [1.0, 2.0]
+        [2.0, 1.0]
       >
       iex> eigenvecs
       #Nx.Tensor<
         f32[2][2]
         [
-          [1.0, 0.0],
+          [-1.0, 0.0],
           [0.0, 1.0]
         ]
       >
@@ -846,7 +846,7 @@ defmodule Nx.LinAlg do
       ** (ArgumentError) tensor must be a square matrix (a tensor with two equal axes), got shape: {2, 3}
 
       iex> Nx.LinAlg.eigh(Nx.tensor([[1, 2], [3, 4]]))
-      ** (ArgumentError) input tensor must be symmetric
+      ** (ArgumentError) input tensor must be self-adjoint
   """
   def eigh(tensor, opts \\ []) do
     opts = keyword!(opts, max_iter: 50_000, eps: @default_eps)
